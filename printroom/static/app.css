@@ -219,7 +219,31 @@ select {
 .banner.ok { border-color: var(--accent); background: var(--ok-bg); color: var(--ok); }
 
 .collation { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.sheet-chip {
+
+.versions { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.version {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fcfaf5;
+  padding: 4px 10px;
+}
+.version.active { border-color: var(--accent); background: var(--ok-bg); }
+.version summary {
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: baseline;
+  list-style: none;
+}
+.version summary::-webkit-details-marker { display: none; }
+.version summary::before { content: "▸"; color: var(--muted); }
+.version[open] summary::before { content: "▾"; }
+.version .current-tag { color: var(--ok); font-size: 12px; }
+.version .pages { margin: 6px 0 4px; }
+.swap-bar { align-items: center; }
+.swap-bar select { flex: 1; min-width: 220px; }
+.swap-none { font-size: 13px; }.sheet-chip {
   display: inline-flex;
   gap: 4px;
   align-items: baseline;

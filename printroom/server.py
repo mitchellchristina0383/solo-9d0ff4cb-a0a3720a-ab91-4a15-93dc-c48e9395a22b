@@ -161,7 +161,21 @@ class Handler(BaseHTTPRequestHandler):
             printer = str(data.get("printer_id") or "").strip()
             if not printer:
                 raise service.ServiceError("请选择打印机", 400, "invalid_printer")
-            self._json(service.start_job(dbp, int(m.group(1)), printer))
+            expected_raw = data.get("expected_document_id")
+            expected_doc: Optional[int] = None
+            if expected_raw is not None:
+                try:
+                    expected_doc = int(expected_raw)
+                except (TypeError, ValueError):
+                    raise service.ServiceError(
+                        "expected_document_id 必须是整数", 400, "invalid_field"
+                    )
+            self._json(service.start_job(dbp, int(m.group(1)), printer, expected_doc))
+            return
+
+        m = re.fullmatch(r"/api/jobs/(\d+)/swap-document", path)
+        if m:
+            self._json(service.swap_document(dbp, int(m.group(1)), int_field("document_id")))
             return
 
         m = re.fullmatch(r"/api/jobs/(\d+)/print", path)

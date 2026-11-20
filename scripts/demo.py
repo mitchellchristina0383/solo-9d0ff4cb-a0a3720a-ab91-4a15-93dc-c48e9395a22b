@@ -107,6 +107,64 @@ def main() -> int:
         _, job = call(base, "GET", f"/api/jobs/{job2}")
         print(f"  作业状态 {job['status']}，完整出纸 {job['printed_sheets']}/{job['total_sheets']} 张")
 
+        show("试跑三：两个网页交错——换稿与开打（讲义排队后改版稿才到）")
+        # 讲义 v1 已排队
+        _, doc_v1 = post("/api/documents", {"title": "讲义v1"})
+        for i in range(2):
+            post(f"/api/documents/{doc_v1['id']}/pages", {"content": f"v1 第 {i + 1} 页"})
+        _, job3 = post(f"/api/documents/{doc_v1['id']}/finalize")
+        job3_id = job3["id"]
+        print(f"  作业 #{job3_id} 《讲义v1》 2 页已排队（第 {job3['document_version']} 版）")
+
+        # 页面甲打开，记下当前稿；页面乙录入改版稿（不提交入队）
+        _, state = call(base, "GET", "/api/state")
+        seen_by_a = next(j for j in state["jobs"] if j["id"] == job3_id)["document_id"]
+        print(f"  页面甲打开，看到当前稿为文档 #{seen_by_a}")
+        _, doc_v2 = post("/api/documents", {"title": "讲义v2改版"})
+        for i in range(4):
+            post(f"/api/documents/{doc_v2['id']}/pages", {"content": f"v2 第 {i + 1} 页"})
+        print(f"  页面乙录入改版稿（文档 #{doc_v2['id']}，4 页，未入队），给作业 #{job3_id} 换稿")
+        code, job3 = post(f"/api/jobs/{job3_id}/swap-document", {"document_id": doc_v2["id"]})
+        print(f"  换稿 -> {code}：作业号 #{job3['id']} 不变，第 {job3['document_version']} 版，"
+              f"{job3['page_count']} 页 / {job3['total_sheets']} 张按新版重算")
+
+        # 页面甲仍持旧稿点开打：须提示重新确认，机台不启动
+        code, body = post(f"/api/jobs/{job3_id}/start",
+                          {"printer_id": "P1", "expected_document_id": seen_by_a})
+        print(f"  页面甲（旧页面）点开打 -> {code} {body.get('code')}：{body.get('error')}")
+        _, state = call(base, "GET", "/api/state")
+        p1 = next(p for p in state["printers"] if p["id"] == "P1")
+        j3 = next(j for j in state["jobs"] if j["id"] == job3_id)
+        print(f"  机台未启动：一号机 {p1['state']}，作业仍 {j3['status']}")
+
+        # 页面甲刷新后按新稿重新确认开打
+        code, job3 = post(f"/api/jobs/{job3_id}/start",
+                          {"printer_id": "P1", "expected_document_id": doc_v2["id"]})
+        print(f"  页面甲刷新后重新确认开打 -> {code}，按第 {job3['document_version']} 版出纸")
+        sheet(job3_id, 1)
+        sheet(job3_id, 2)
+        _, job3 = call(base, "GET", f"/api/jobs/{job3_id}")
+        print(f"  作业状态 {job3['status']}，末张页码 正{job3['records'][0]['front_page']}"
+              f"/背{job3['records'][0]['back_page']}（按改版 4 页算）")
+
+        # 已开打的作业拒绝换稿（用另一个在印作业演示）
+        _, doc_v3 = post("/api/documents", {"title": "讲义v3再改版"})
+        post(f"/api/documents/{doc_v3['id']}/pages", {"content": "v3 第 1 页"})
+        job4 = make_job("照常开打的旧作业", 2)
+        post(f"/api/jobs/{job4}/start", {"printer_id": "P1"})
+        code, body = post(f"/api/jobs/{job4}/swap-document", {"document_id": doc_v3["id"]})
+        print(f"  作业 #{job4} 已开打，换稿 -> {code} {body.get('code')}（应被拒绝）")
+        sheet(job4, 1)
+        _, job4 = call(base, "GET", f"/api/jobs/{job4}")
+        print(f"  旧作业（从未换稿）照常开打并完成：{job4['status']}")
+
+        show("作业 #{0} 的换稿记录（重启后仍可查）".format(job3_id))
+        _, job3 = call(base, "GET", f"/api/jobs/{job3_id}")
+        for v in job3["document_history"]:
+            mark = "当前用稿" if v["active"] else "已换下"
+            print(f"  第 {v['version']} 版 · 文档 #{v['document_id']}《{v['title']}》 "
+                  f"{v['page_count']} 页 · {mark} · {v['since']} 起")
+
         show("出纸记录（网页“出纸记录”表同源）")
         _, state = call(base, "GET", "/api/state")
         for rec in reversed(state["records"]):

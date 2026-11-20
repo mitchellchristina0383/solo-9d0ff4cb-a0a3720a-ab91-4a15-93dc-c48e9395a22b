@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS print_segments (
     note             TEXT
 );
 
+-- 换稿记录：作业未开打前换用另一份稿，每换一次记一条。
+-- 当前稿就是 jobs.document_id；此表保存完整换稿历史，重启后可查。
+CREATE TABLE IF NOT EXISTS job_document_swaps (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           INTEGER NOT NULL REFERENCES jobs(id),
+    from_document_id INTEGER NOT NULL REFERENCES documents(id),
+    to_document_id   INTEGER NOT NULL REFERENCES documents(id),
+    from_page_count  INTEGER NOT NULL,
+    to_page_count    INTEGER NOT NULL,
+    swapped_at       TEXT NOT NULL
+);
+
 -- 每一张纸的一次打印尝试。半张卡纸会留下 scrapped 记录，续印会新建一条尝试。
 CREATE TABLE IF NOT EXISTS sheet_attempts (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,6 +108,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_in_progress_attempt
 CREATE INDEX IF NOT EXISTS ix_segments_job ON print_segments(job_id);
 CREATE INDEX IF NOT EXISTS ix_attempts_job ON sheet_attempts(job_id);
 CREATE INDEX IF NOT EXISTS ix_attempts_segment ON sheet_attempts(segment_id);
+CREATE INDEX IF NOT EXISTS ix_swaps_job ON job_document_swaps(job_id);
 """
 
 

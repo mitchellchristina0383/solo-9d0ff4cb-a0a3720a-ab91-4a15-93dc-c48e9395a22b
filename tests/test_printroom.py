@@ -462,6 +462,273 @@ class RestartTests(BaseCase):
         self.assertEqual(code, 409)
 
 
+class SwapDocumentTests(BaseCase):
+    """换稿：未开打的作业换用另一份录好的稿。"""
+
+    def swap(self, job_id: int, document_id: int):
+        return self.srv.post(
+            f"/api/jobs/{job_id}/swap-document", {"document_id": document_id}
+        )
+
+    def start_with_expected(self, job_id: int, printer: str, expected_document_id: int):
+        return self.srv.post(
+            f"/api/jobs/{job_id}/start",
+            {"printer_id": printer, "expected_document_id": expected_document_id},
+        )
+
+    def test_swap_success_keeps_job_and_queue_position(self):
+        doc_a = self.make_doc("讲义v1", 3)
+        job1 = self.finalize(doc_a)
+        doc_other = self.make_doc("别的作业", 2)
+        job2 = self.finalize(doc_other)
+        doc_b = self.make_doc("讲义v2改版", 5)  # 录好但未入队
+
+        code, job = self.swap(job1["id"], doc_b)
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["id"], job1["id"])  # 作业号不变
+        self.assertEqual(job["created_at"], job1["created_at"])  # 排队位置不变
+        self.assertEqual(job["status"], "queued")
+        self.assertEqual(job["document_id"], doc_b)
+        self.assertEqual(job["page_count"], 5)  # 页数按新版算
+        self.assertEqual(job["total_sheets"], 3)  # 双面张数按新版算
+        self.assertEqual(job["document_version"], 2)
+
+        # 两个作业都还在队列里，先后顺序不变
+        queued = [j["id"] for j in self.state()["jobs"] if j["status"] == "queued"]
+        self.assertEqual(sorted(queued), sorted([job1["id"], job2["id"]]))
+
+    def test_swapped_out_document_still_queryable(self):
+        doc_a = self.make_doc("讲义v1", 3)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 4)
+        code, job = self.swap(job["id"], doc_b)
+        self.assertEqual(code, 200, job)
+
+        # 换下的稿仍可查
+        code, doc = self.srv.get(f"/api/documents/{doc_a}")
+        self.assertEqual(code, 200)
+        self.assertEqual(doc["title"], "讲义v1")
+        self.assertEqual(len(doc["pages"]), 3)
+
+        # 换稿记录：v1 已换下，v2 是当前用稿
+        history = job["document_history"]
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["version"], 1)
+        self.assertEqual(history[0]["document_id"], doc_a)
+        self.assertEqual(history[0]["page_count"], 3)
+        self.assertFalse(history[0]["active"])
+        self.assertEqual(history[1]["version"], 2)
+        self.assertEqual(history[1]["document_id"], doc_b)
+        self.assertEqual(history[1]["page_count"], 4)
+        self.assertTrue(history[1]["active"])
+
+    def test_print_uses_swapped_version(self):
+        """开打按打印员选中的那版算页数与双面张数。"""
+        doc_a = self.make_doc("讲义v1", 2)  # 1 张
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 5)  # 3 张，末张背面留白
+        self.swap(job["id"], doc_b)
+
+        job = self.start(job["id"], "P1")
+        self.assertEqual(job["page_count"], 5)
+        self.assertEqual(job["total_sheets"], 3)
+        for sheet in (1, 2):
+            job = self.print_sheet(job["id"], sheet)
+        code, job = self.print_side(job["id"], "front", 3)
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["status"], "completed")
+        rec = job["records"][0]
+        self.assertEqual(rec["front_page"], 5)
+        self.assertIsNone(rec["back_page"])  # 末张按新版 5 页留白
+
+    def test_stale_page_start_requires_reconfirm(self):
+        """两个网页交错：乙换稿成功后，甲（旧页面）点开打须重新确认，且不启动机台。"""
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        job_id = job["id"]
+
+        # 页面甲打开，看到的当前稿是 doc_a
+        seen_by_page_a = self.job(job_id)["document_id"]
+        self.assertEqual(seen_by_page_a, doc_a)
+
+        # 页面乙录入改版稿并换稿成功
+        doc_b = self.make_doc("讲义v2", 4)
+        code, _ = self.swap(job_id, doc_b)
+        self.assertEqual(code, 200)
+
+        # 页面甲仍持旧稿点开打 → 提示重新确认，机台不启动
+        code, body = self.start_with_expected(job_id, "P1", seen_by_page_a)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "document_changed")
+        self.assertIn("重新确认", body["error"])
+        job_now = self.job(job_id)
+        self.assertEqual(job_now["status"], "queued")  # 未开打
+        self.assertEqual(len(job_now["segments"]), 0)  # 没有派单
+        self.assertEqual(self.printer("P1")["state"], "idle")  # 机台未启动
+
+        # 页面甲刷新后按新稿重新确认 → 正常开打
+        code, job = self.start_with_expected(job_id, "P1", doc_b)
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["status"], "printing")
+        self.assertEqual(job["page_count"], 4)
+
+    def test_swap_rejected_after_start(self):
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 4)
+        self.start(job["id"], "P1")
+        code, body = self.swap(job["id"], doc_b)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "already_started")
+        self.assertEqual(self.job(job["id"])["document_id"], doc_a)
+
+    def test_swap_rejected_after_completed(self):
+        doc_a = self.make_doc("讲义v1", 1)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 2)
+        self.start(job["id"], "P1")
+        self.print_side(job["id"], "front", 1)
+        self.assertEqual(self.job(job["id"])["status"], "completed")
+        code, body = self.swap(job["id"], doc_b)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "already_started")
+
+    def test_failed_swap_keeps_original_queued(self):
+        """换稿失败仍按原稿排队。"""
+        doc_a = self.make_doc("讲义v1", 3)
+        job = self.finalize(doc_a)
+        job_id = job["id"]
+        _, empty_doc = self.srv.post("/api/documents", {"title": "空稿"})
+        doc_c = self.make_doc("别人讲义", 2)
+        self.finalize(doc_c)  # doc_c 已被另一个作业占用
+
+        code, body = self.swap(job_id, empty_doc["id"])
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["code"], "empty_document")
+        code, body = self.swap(job_id, doc_c)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["code"], "document_in_use")
+        code, body = self.swap(job_id, 99999)
+        self.assertEqual(code, 404, body)
+
+        job_now = self.job(job_id)
+        self.assertEqual(job_now["document_id"], doc_a)
+        self.assertEqual(job_now["status"], "queued")
+        self.assertEqual(job_now["page_count"], 3)
+        self.assertEqual(job_now["document_version"], 1)
+        self.assertEqual(len(job_now["document_history"]), 1)
+
+    def test_swap_history_survives_restart(self):
+        """重启后能查当前稿和换稿记录。"""
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 4)
+        doc_c = self.make_doc("讲义v3", 6)
+        self.swap(job["id"], doc_b)
+        self.swap(job["id"], doc_c)
+
+        self.srv.close()
+        self.srv = ServerFixture(self.db_path)
+
+        restored = self.job(job["id"])
+        self.assertEqual(restored["document_id"], doc_c)  # 当前稿正确
+        self.assertEqual(restored["document_version"], 3)
+        history = restored["document_history"]
+        self.assertEqual([h["document_id"] for h in history], [doc_a, doc_b, doc_c])
+        self.assertEqual([h["active"] for h in history], [False, False, True])
+        # 换下的稿重启后仍可查
+        code, doc = self.srv.get(f"/api/documents/{doc_a}")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(doc["pages"]), 2)
+
+    def test_legacy_job_starts_normally(self):
+        """旧作业照常开打；不带版本号的旧客户端也能开打。"""
+        doc_a = self.make_doc("旧作业", 2)
+        job = self.finalize(doc_a)
+        self.assertEqual(job["document_version"], 1)
+        self.assertEqual(len(job["document_history"]), 1)
+        code, job = self.srv.post(f"/api/jobs/{job['id']}/start", {"printer_id": "P1"})
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["status"], "printing")
+
+    def test_swap_back_to_previous_version(self):
+        """换下的稿可以再换回来。"""
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 4)
+        code, job = self.swap(job["id"], doc_b)
+        self.assertEqual(code, 200, job)
+        code, job = self.swap(job["id"], doc_a)
+        self.assertEqual(code, 200, job)
+        self.assertEqual(job["document_id"], doc_a)
+        self.assertEqual(job["page_count"], 2)
+        self.assertEqual(job["document_version"], 3)
+        self.assertEqual(len(job["document_history"]), 3)
+        job = self.start(job["id"], "P1")
+        self.assertEqual(job["status"], "printing")
+
+    def test_swap_to_current_document_is_noop(self):
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        code, job2 = self.swap(job["id"], doc_a)
+        self.assertEqual(code, 200, job2)
+        self.assertEqual(job2["document_version"], 1)
+        self.assertEqual(len(job2["document_history"]), 1)
+
+    def test_swapped_draft_is_locked(self):
+        """被换上的未入队稿立即锁定，不能再增删页面。"""
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        doc_b = self.make_doc("讲义v2", 4)
+        self.swap(job["id"], doc_b)
+        code, body = self.srv.post(f"/api/documents/{doc_b}/pages", {"content": "迟到页"})
+        self.assertEqual(code, 409, body)
+        code, doc = self.srv.get(f"/api/documents/{doc_b}")
+        self.assertEqual(code, 200)
+        self.assertEqual(doc["status"], "ready")
+
+    def test_concurrent_swap_and_start_exactly_one_wins(self):
+        """换稿与开打并发：恰好一个成功，状态不自相矛盾。"""
+        doc_a = self.make_doc("讲义v1", 2)
+        job = self.finalize(doc_a)
+        job_id = job["id"]
+        doc_b = self.make_doc("讲义v2", 4)
+
+        results = {}
+        lock = threading.Lock()
+
+        def do_swap():
+            code, _ = self.swap(job_id, doc_b)
+            with lock:
+                results["swap"] = code
+
+        def do_start():
+            code, _ = self.srv.post(
+                f"/api/jobs/{job_id}/start",
+                {"printer_id": "P1", "expected_document_id": doc_a},
+            )
+            with lock:
+                results["start"] = code
+
+        threads = [threading.Thread(target=do_swap), threading.Thread(target=do_start)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sorted(results.values()), [200, 409], results)
+        final = self.job(job_id)
+        if results["start"] == 200:
+            # 开打先成功：换稿被拒，作业按原稿开打
+            self.assertEqual(final["status"], "printing")
+            self.assertEqual(final["document_id"], doc_a)
+        else:
+            # 换稿先成功：旧页面开打被拒，机台未启动
+            self.assertEqual(final["status"], "queued")
+            self.assertEqual(final["document_id"], doc_b)
+            self.assertEqual(self.printer("P1")["state"], "idle")
+
+
 class ConcurrencyTests(BaseCase):
     def test_duplicate_switch_requests_create_one_continuation(self):
         job_id = self.finalize(self.make_doc("并发换机", 8))["id"]

@@ -242,16 +242,89 @@ def finalize_document(db_path: str, document_id: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# 换稿（作业未开打前换用另一份录好的稿）
+# --------------------------------------------------------------------------
+
+
+def swap_document(db_path: str, job_id: int, document_id: int) -> dict[str, Any]:
+    """给排队中的作业换用另一份稿。
+
+    保留作业号与排队位置；页数、双面张数按新稿重算；换下的稿保留在
+    换稿记录里可查。任何校验失败都回滚，作业仍按原稿排队。
+    """
+    with db.transaction(db_path) as conn:
+        job = _get_job(conn, job_id)
+        if job["status"] != "queued":
+            raise ServiceError(
+                f"作业已开打（{STATUS_LABELS.get(job['status'], job['status'])}），不能换稿",
+                code="already_started",
+            )
+        target = _get_document(conn, document_id)
+        if document_id == job["document_id"]:
+            # 目标就是当前稿：幂等返回，不产生换稿记录。
+            return _serialize_job(conn, job)
+        if target["page_count"] < 1:
+            raise ServiceError("该稿还没有页面，不能换用", status=400, code="empty_document")
+        occupant = conn.execute(
+            "SELECT id FROM jobs WHERE document_id = ?", (document_id,)
+        ).fetchone()
+        if occupant is not None:
+            raise ServiceError(
+                f"该稿已作为作业 #{occupant['id']} 排队，不能重复换用",
+                code="document_in_use",
+            )
+
+        old_doc = _get_document(conn, job["document_id"])
+        ts = now_iso()
+        total_sheets = (target["page_count"] + 1) // 2
+        if target["status"] == "draft":
+            # 录完未入队的稿被换用后立刻锁定，不能再增删页面。
+            conn.execute(
+                "UPDATE documents SET status = 'ready', finalized_at = ? WHERE id = ?",
+                (ts, document_id),
+            )
+        conn.execute(
+            "UPDATE jobs SET document_id = ?, page_count = ?, total_sheets = ? WHERE id = ?",
+            (document_id, target["page_count"], total_sheets, job_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO job_document_swaps
+                (job_id, from_document_id, to_document_id,
+                 from_page_count, to_page_count, swapped_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, old_doc["id"], document_id,
+             old_doc["page_count"], target["page_count"], ts),
+        )
+        return _serialize_job(conn, _get_job(conn, job_id))
+
+
+# --------------------------------------------------------------------------
 # 打印机操作
 # --------------------------------------------------------------------------
 
 
-def start_job(db_path: str, job_id: int, printer_id: str) -> dict[str, Any]:
+def start_job(
+    db_path: str,
+    job_id: int,
+    printer_id: str,
+    expected_document_id: Optional[int] = None,
+) -> dict[str, Any]:
     with db.transaction(db_path) as conn:
         job = _get_job(conn, job_id)
         _require_printer(conn, printer_id)
         if job["status"] != "queued":
             raise ServiceError(f"作业当前为“{STATUS_LABELS.get(job['status'], job['status'])}”，不能开始")
+        if expected_document_id is not None and expected_document_id != job["document_id"]:
+            # 页面显示的还是换稿前的旧稿：提示重新确认，本次不启动机台。
+            current = _get_document(conn, job["document_id"])
+            version = _document_version(conn, job_id)
+            raise ServiceError(
+                f"稿件已更换为《{current['title']}》（第 {version} 版），"
+                "请核对新稿后重新确认开打",
+                code="document_changed",
+            )
         if not _printer_is_free(conn, printer_id):
             raise ServiceError("该打印机正忙", code="printer_busy")
         ts = now_iso()
@@ -480,12 +553,66 @@ def _document_dict(conn: sqlite3.Connection, document_id: int) -> dict[str, Any]
     return out
 
 
+def _document_version(conn: sqlite3.Connection, job_id: int) -> int:
+    """当前稿是第几版：原始稿为第 1 版，每成功换稿一次加一。"""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM job_document_swaps WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    return row[0] + 1
+
+
+def _document_history(conn: sqlite3.Connection, job: sqlite3.Row) -> list[dict[str, Any]]:
+    """稿件版本时间线：从原始稿到当前稿，含每版页数与起止时间。"""
+    swaps = conn.execute(
+        "SELECT * FROM job_document_swaps WHERE job_id = ? ORDER BY id", (job["id"],)
+    ).fetchall()
+
+    def doc_title(document_id: int) -> str:
+        row = conn.execute(
+            "SELECT title FROM documents WHERE id = ?", (document_id,)
+        ).fetchone()
+        return row["title"] if row else ""
+
+    if not swaps:
+        return [{
+            "version": 1,
+            "document_id": job["document_id"],
+            "title": doc_title(job["document_id"]),
+            "page_count": job["page_count"],
+            "active": True,
+            "since": job["created_at"],
+            "until": None,
+        }]
+    history = [{
+        "version": 1,
+        "document_id": swaps[0]["from_document_id"],
+        "title": doc_title(swaps[0]["from_document_id"]),
+        "page_count": swaps[0]["from_page_count"],
+        "active": False,
+        "since": job["created_at"],
+        "until": swaps[0]["swapped_at"],
+    }]
+    for index, swap in enumerate(swaps):
+        history.append({
+            "version": index + 2,
+            "document_id": swap["to_document_id"],
+            "title": doc_title(swap["to_document_id"]),
+            "page_count": swap["to_page_count"],
+            "active": index == len(swaps) - 1,
+            "since": swap["swapped_at"],
+            "until": swaps[index + 1]["swapped_at"] if index + 1 < len(swaps) else None,
+        })
+    return history
+
+
 def _serialize_job(conn: sqlite3.Connection, job: sqlite3.Row) -> dict[str, Any]:
     doc = conn.execute(
         "SELECT title FROM documents WHERE id = ?", (job["document_id"],)
     ).fetchone()
     out = _row(job)
     out["title"] = doc["title"] if doc else ""
+    out["document_version"] = _document_version(conn, job["id"])
+    out["document_history"] = _document_history(conn, job)
     out["printed_sheets"] = conn.execute(
         "SELECT COUNT(*) FROM sheet_attempts WHERE job_id = ? AND status = 'complete'",
         (job["id"],),

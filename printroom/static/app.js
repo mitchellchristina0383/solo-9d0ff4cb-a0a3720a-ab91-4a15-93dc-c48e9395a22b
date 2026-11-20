@@ -1,6 +1,6 @@
 "use strict";
 
-const state = { data: null, editingDocId: null, busy: false, clearPageDraft: false, focusPage: false };
+const state = { data: null, editingDocId: null, busy: false, clearPageDraft: false, focusPage: false, expandedDocs: new Set() };
 
 const STATUS_TEXT = {
   draft: "草稿",
@@ -232,12 +232,19 @@ function renderPrinters() {
       if (queued.length) {
         const select = el("select", { class: "small" });
         for (const job of queued) {
-          select.append(el("option", { value: job.id, text: `#${job.id} 《${job.title}》 ${job.page_count} 页` }));
+          select.append(el("option", { value: job.id, text: `#${job.id} 《${job.title}》 ${job.page_count} 页 · 第${job.document_version}版` }));
         }
         panel.append(el("div", { class: "actions" },
           select,
           el("button", { class: "small", type: "button", text: "开始打印",
-            onclick: () => act(() => api("POST", `/api/jobs/${select.value}/start`, { printer_id: printer.id }), "已开始打印") }),
+            onclick: () => {
+              // 带上本页面当前看到的稿件版本；若另一页面已换稿，服务器会拒绝并要求重新确认。
+              const picked = jobs.find((j) => j.id === Number(select.value));
+              act(() => api("POST", `/api/jobs/${select.value}/start`, {
+                printer_id: printer.id,
+                expected_document_id: picked ? picked.document_id : undefined,
+              }), "已开始打印");
+            } }),
         ));
       }
     } else if (printer.state === "printing" && activeJob) {
@@ -270,6 +277,72 @@ function renderPrinters() {
 
 // ---------------------------------------------------------------- 作业
 
+function docById(id) {
+  return state.data.documents.find((d) => d.id === id) || null;
+}
+
+// 稿件版本时间线：当前版高亮，每一版（含换下的稿）都可展开查看页面。
+function renderVersionHistory(job) {
+  const wrap = el("div", { class: "versions" });
+  wrap.append(el("div", { class: "muted", text:
+    `当前用稿：第 ${job.document_version} 版 · 文档 #${job.document_id}《${job.title}》 · ${job.page_count} 页 / ${job.total_sheets} 张` }));
+  const history = job.document_history || [];
+  if (history.length <= 1) return wrap;
+  for (const v of history) {
+    const details = el("details", {
+      class: `version${v.active ? " active" : ""}`,
+      ontoggle: (event) => {
+        if (event.target.open) state.expandedDocs.add(v.document_id);
+        else state.expandedDocs.delete(v.document_id);
+      },
+    });
+    if (state.expandedDocs.has(v.document_id)) details.setAttribute("open", "");
+    details.append(el("summary", {},
+      el("span", { text: `第 ${v.version} 版 · #${v.document_id}《${v.title}》 ${v.page_count} 页` }),
+      v.active ? el("b", { class: "current-tag", text: "当前用稿" }) : el("span", { class: "muted", text: "已换下" }),
+      el("span", { class: "muted", text: `${fmtTime(v.since)} 起` }),
+    ));
+    const doc = docById(v.document_id);
+    if (doc && doc.pages) {
+      const pages = el("ul", { class: "pages" });
+      for (const p of doc.pages) {
+        const empty = !p.content.trim();
+        pages.append(el("li", {},
+          el("span", { class: "no", text: `第 ${p.page_no} 页` }),
+          el("span", { class: `txt${empty ? " empty" : ""}`, text: empty ? "（空白页）" : p.content }),
+        ));
+      }
+      details.append(pages);
+    }
+    wrap.append(details);
+  }
+  return wrap;
+}
+
+// 换稿控件：仅排队中的作业可换；候选是录好且未被其它作业占用的稿。
+function renderSwapControls(job) {
+  const candidates = state.data.documents.filter((d) =>
+    d.id !== job.document_id && d.page_count >= 1 &&
+    (d.status === "draft" || (d.status === "ready" && !d.job_id)));
+  if (!candidates.length) {
+    return el("div", { class: "muted swap-none", text: "没有可换用的稿：可先在左侧录入改版稿（不必提交入队）。" });
+  }
+  const select = el("select", { class: "small" });
+  for (const d of candidates) {
+    const kind = d.status === "draft" ? "未入队" : "已换下";
+    select.append(el("option", { value: d.id, text: `#${d.id}《${d.title}》 ${d.page_count} 页（${kind}）` }));
+  }
+  return el("div", { class: "actions swap-bar" },
+    el("span", { class: "muted", text: "换稿：" }),
+    select,
+    el("button", { class: "small", type: "button", text: "换用选中的稿",
+      onclick: () => act(
+        () => api("POST", `/api/jobs/${job.id}/swap-document`, { document_id: Number(select.value) }),
+        "已换用新稿，页数与双面张数已按新稿重算",
+      ) }),
+  );
+}
+
 function renderJobs() {
   const { jobs } = state.data;
   const wrap = document.getElementById("jobs");
@@ -283,7 +356,7 @@ function renderJobs() {
     card.append(el("div", { class: "job-head" },
       el("div", {},
         el("span", { class: "job-title", text: `#${job.id} 《${job.title}》` }),
-        el("span", { class: "muted", text: ` · ${job.page_count} 页 / ${job.total_sheets} 张` }),
+        el("span", { class: "muted", text: ` · ${job.page_count} 页 / ${job.total_sheets} 张 · 第 ${job.document_version} 版` }),
       ),
       badge(job.status),
     ));
@@ -306,6 +379,8 @@ function renderJobs() {
         el("span", {}, "待处理张号 ", el("b", { text: job.current_sheet ? String(job.current_sheet) : "—" })),
         el("span", {}, "状态 ", el("b", { text: STATUS_TEXT[job.status] || job.status })),
       ),
+      renderVersionHistory(job),
+      job.status === "queued" ? renderSwapControls(job) : null,
       segments,
       job.collation && job.collation.length ? el("div", {},
         el("div", { class: "muted", text: "装订核对（完整出纸，按张号；按此顺序叠放即为原页序）：" }),
